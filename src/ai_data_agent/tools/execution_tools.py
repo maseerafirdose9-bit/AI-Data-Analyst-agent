@@ -1,12 +1,11 @@
 # src/ai_data_agent/tools/execution_tools.py
 
 import logging
-import signal
-import platform
-from typing import Any
+import threading
 
 import pandas as pd
 from pydantic import BaseModel, Field, ConfigDict
+from typing import Any
 
 from ai_data_agent.tools.code_validation import validate_code_statically
 
@@ -24,23 +23,18 @@ class ExecuteCodeOutput(BaseModel):
 
     success: bool
     result_repr: str | None = None
-    result_value: Any = None  # the real Python/pandas object, not just its string repr
+    result_value: Any = None
     error_message: str | None = None
-
-
-class _TimeoutError(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise _TimeoutError("Code execution exceeded the time limit.")
 
 
 def execute_python_code(df: pd.DataFrame, input_data: ExecuteCodeInput) -> ExecuteCodeOutput:
     """
     Executes LLM-generated Pandas code inside a restricted namespace,
-    after static validation. Only `pd` and `df` are exposed — no
-    builtins like open(), no imports, no filesystem/network access.
+    after static validation. Uses a worker thread with a join-timeout
+    for cross-platform, thread-safe timeout enforcement — Python's
+    signal-based timeout only works in the main thread of the main
+    interpreter, which breaks under Streamlit Cloud's threading model
+    (and on Windows entirely). A thread-based timeout works everywhere.
     """
     code = _strip_markdown_fences(input_data.code)
 
@@ -58,35 +52,47 @@ def execute_python_code(df: pd.DataFrame, input_data: ExecuteCodeInput) -> Execu
     local_namespace = {"df": df, "pd": pd}
     global_namespace = {"__builtins__": safe_builtins}
 
-    use_signal_timeout = platform.system() != "Windows"
-    if use_signal_timeout:
-        signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(EXECUTION_TIMEOUT_SECONDS)
+    outcome: dict[str, Any] = {}
 
-    try:
-        exec(code, global_namespace, local_namespace)  # noqa: S102 — intentional, sandboxed
-        result = local_namespace.get("result")
+    def _run():
+        try:
+            exec(code, global_namespace, local_namespace)  # noqa: S102 — intentional, sandboxed
+            outcome["result"] = local_namespace.get("result")
+        except Exception as exc:
+            outcome["exception"] = exc
 
-        if result is None:
-            return ExecuteCodeOutput(
-                success=False,
-                error_message="Code executed but did not assign a `result` variable.",
-            )
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=EXECUTION_TIMEOUT_SECONDS)
 
-        if isinstance(result, str) and result.startswith("UNANSWERABLE"):
-            return ExecuteCodeOutput(success=False, error_message=result)
-
-        return ExecuteCodeOutput(success=True, result_repr=repr(result), result_value=result)
-
-    except _TimeoutError as exc:
+    if worker.is_alive():
+        # The thread is still running after our timeout — we can't
+        # forcibly kill a Python thread, but marking it daemon=True
+        # ensures it won't block process shutdown, and we simply stop
+        # waiting on it and report a timeout to the caller.
         logger.error("Code execution timed out.")
-        return ExecuteCodeOutput(success=False, error_message=str(exc))
-    except Exception as exc:
+        return ExecuteCodeOutput(
+            success=False,
+            error_message=f"Code execution exceeded the {EXECUTION_TIMEOUT_SECONDS}s time limit.",
+        )
+
+    if "exception" in outcome:
+        exc = outcome["exception"]
         logger.error("Code execution failed: %s", exc)
         return ExecuteCodeOutput(success=False, error_message=f"{type(exc).__name__}: {exc}")
-    finally:
-        if use_signal_timeout:
-            signal.alarm(0)
+
+    result = outcome.get("result")
+
+    if result is None:
+        return ExecuteCodeOutput(
+            success=False,
+            error_message="Code executed but did not assign a `result` variable.",
+        )
+
+    if isinstance(result, str) and result.startswith("UNANSWERABLE"):
+        return ExecuteCodeOutput(success=False, error_message=result)
+
+    return ExecuteCodeOutput(success=True, result_repr=repr(result), result_value=result)
 
 
 def _strip_markdown_fences(code: str) -> str:
