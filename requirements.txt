@@ -1,0 +1,12 @@
+pandas
+langgraph
+langchain
+langchain-google-genai
+pydantic
+pydantic-settings
+plotly
+matplotlib
+streamlit
+python-dotenv
+openpyxl
+pyarrow

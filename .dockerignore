@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+tests/
+src/ai_data_agent/agent/test/
+data/*.csv
+!data/sample_sales.csv
+*.md

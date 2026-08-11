@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+data/*.csv
+data/*.xlsx
+data/*.parquet
+!data/sample_*.csv
